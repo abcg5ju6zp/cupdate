@@ -3,6 +3,7 @@ package vulndb
 import (
 	"context"
 	"database/sql"
+	"sync"
 	"time"
 
 	"github.com/AlexGustafsson/cupdate/internal/osv"
@@ -12,6 +13,10 @@ import (
 
 type Conn struct {
 	db *sql.DB
+
+	// onClose, if set, releases the generation reader lease exactly once.
+	onClose func()
+	once    sync.Once
 }
 
 func Open(uri string) (*Conn, error) {
@@ -94,5 +99,9 @@ func (c *Conn) GetGitHubAdvisoriesForRepository(ctx context.Context, repository 
 }
 
 func (c *Conn) Close() error {
-	return c.db.Close()
+	err := c.db.Close()
+	if c.onClose != nil {
+		c.once.Do(c.onClose)
+	}
+	return err
 }
