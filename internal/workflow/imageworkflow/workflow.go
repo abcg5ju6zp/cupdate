@@ -14,6 +14,10 @@ import (
 )
 
 func New(httpClient httputil.Requester, data *Data) workflow.Workflow {
+	// Pinned reference targets the generation's manifest digest. Tag-based
+	// version discovery still uses the underlying tagged reference.
+	pinnedReference := data.PinnedReference()
+
 	return workflow.Workflow{
 		Name: "Process image",
 		Jobs: []workflow.Job{
@@ -29,29 +33,14 @@ func New(httpClient httputil.Requester, data *Data) workflow.Workflow {
 					GetManifest().
 						WithID("manifest").
 						With("registryClient", workflow.Ref{Key: "step.registry.client"}).
-						With("reference", data.UnderlyingImageReference),
+						With("reference", pinnedReference),
 					GetAnnotations().
 						WithID("annotations").
 						With("registryClient", workflow.Ref{Key: "step.registry.client"}).
-						With("reference", data.UnderlyingImageReference).
-						With("manifest", workflow.Ref{Key: "step.manifest.manifest"}),
-					GetLatestReference().
-						WithID("latest").
-						With("registryClient", workflow.Ref{Key: "step.registry.client"}).
-						With("reference", data.UnderlyingImageReference).
-						With("graphReference", data.ImageReference).
-						With("graph", data.Graph),
-					GetManifest().
-						WithID("latest-manifest").
-						WithCondition(workflow.ValueExists("step.latest.reference")).
-						With("registryClient", workflow.Ref{Key: "step.registry.client"}).
-						With("reference", workflow.Ref{Key: "step.latest.reference"}),
-					GetAnnotations().
-						WithID("latest-annotations").
-						WithCondition(workflow.ValueExists("step.latest.reference")).
-						With("registryClient", workflow.Ref{Key: "step.registry.client"}).
-						With("reference", workflow.Ref{Key: "step.latest.reference"}).
-						With("manifest", workflow.Ref{Key: "step.latest-manifest.manifest"}),
+						With("reference", pinnedReference).
+						With("manifest", workflow.Ref{Key: "step.manifest.manifest"}).
+						With("architecture", data.PlatformArch).
+						With("os", data.PlatformOS),
 					workflow.Run(func(ctx workflow.Context) (workflow.Command, error) {
 						domain, err := workflow.GetValue[string](ctx, "step.registry.domain")
 						if err != nil {
@@ -96,16 +85,52 @@ func New(httpClient httputil.Requester, data *Data) workflow.Workflow {
 							data.Created = &time
 						}
 
+						return nil, nil
+					}),
+				},
+			},
+			{
+				// Version discovery is a separate stage. Registry pagination
+				// interruptions here mark only the versions stage as failed and
+				// never discard the already collected manifest information.
+				ID:        "versions",
+				Name:      "Get version information",
+				DependsOn: []string{"oci"},
+				Steps: []workflow.Step{
+					GetLatestReference().
+						WithID("latest").
+						With("registryClient", workflow.Ref{Key: "job.oci.step.registry.client"}).
+						With("reference", data.UnderlyingImageReference).
+						With("graphReference", data.ImageReference).
+						With("graph", data.Graph),
+					GetManifest().
+						WithID("latest-manifest").
+						WithCondition(workflow.ValueExists("step.latest.reference")).
+						With("registryClient", workflow.Ref{Key: "job.oci.step.registry.client"}).
+						With("reference", workflow.Ref{Key: "step.latest.reference"}),
+					GetAnnotations().
+						WithID("latest-annotations").
+						WithCondition(workflow.ValueExists("step.latest.reference")).
+						With("registryClient", workflow.Ref{Key: "job.oci.step.registry.client"}).
+						With("reference", workflow.Ref{Key: "step.latest.reference"}).
+						With("manifest", workflow.Ref{Key: "step.latest-manifest.manifest"}),
+					workflow.Run(func(ctx workflow.Context) (workflow.Command, error) {
 						reference, err := workflow.GetValue[*oci.Reference](ctx, "step.latest.reference")
 						if err != nil {
 							return nil, err
+						}
+
+						// No newer version was identified (digest-pinned reference,
+						// non-semver tag, ...)
+						if reference == nil {
+							return nil, nil
 						}
 
 						// As the latest reference might have been found using an underlying
 						// image reference (due to mirrors), ensure that the final domain
 						// is that of the mirror
 						{
-							r := (*reference).WithDomain(data.ImageReference.Domain)
+							r := reference.WithDomain(data.ImageReference.Domain)
 							data.LatestReference = &r
 						}
 
@@ -135,28 +160,43 @@ func New(httpClient httputil.Requester, data *Data) workflow.Workflow {
 					GetAttestationManifests().
 						WithID("attestations").
 						With("registryClient", workflow.Ref{Key: "job.oci.step.registry.client"}).
-						With("reference", data.UnderlyingImageReference),
+						With("reference", pinnedReference).
+						With("architecture", data.PlatformArch).
+						With("os", data.PlatformOS),
 					GetProvenanceAttestations().
 						WithID("provenance").
 						With("registryClient", workflow.Ref{Key: "job.oci.step.registry.client"}).
-						With("reference", data.UnderlyingImageReference).
+						With("reference", pinnedReference).
 						With("manifests", workflow.Ref{Key: "step.attestations.manifests"}),
 					GetSBOMAttestations().
 						WithID("sbom").
 						With("registryClient", workflow.Ref{Key: "job.oci.step.registry.client"}).
-						With("reference", data.UnderlyingImageReference).
+						With("reference", pinnedReference).
 						With("manifests", workflow.Ref{Key: "step.attestations.manifests"}),
 					workflow.Run(func(ctx workflow.Context) (workflow.Command, error) {
+						// Listing errors affect both attestation stages
+						listingErrors, _ := workflow.GetValue[[]string](ctx, "step.attestations.errors")
+						for _, err := range listingErrors {
+							data.AddStageError(StageProvenance, err)
+							data.AddStageError(StageSBOM, err)
+						}
+						provenanceErrors, _ := workflow.GetValue[[]string](ctx, "step.provenance.errors")
+						for _, err := range provenanceErrors {
+							data.AddStageError(StageProvenance, err)
+						}
+						sbomErrors, _ := workflow.GetValue[[]string](ctx, "step.sbom.errors")
+						for _, err := range sbomErrors {
+							data.AddStageError(StageSBOM, err)
+						}
 						currentManifest, err := workflow.GetValue[any](ctx, "job.oci.step.manifest.manifest")
 						if err != nil {
 							return nil, err
 						}
 
 						currentIndexManifest, ok := currentManifest.(*oci.ImageIndex)
-						if ok {
-							if currentIndexManifest.HasAttestationManifest() {
-								data.InsertTag("attestation")
-							}
+						if ok && currentIndexManifest.HasAttestationManifest() {
+							data.HasAttestationManifest = true
+							data.InsertTag("attestation")
 						}
 
 						index, _ := currentManifest.(*oci.ImageIndex)

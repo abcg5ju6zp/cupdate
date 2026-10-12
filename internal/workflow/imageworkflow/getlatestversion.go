@@ -152,6 +152,13 @@ func GetLatestReference() workflow.Step {
 				}
 			}
 
+			// Don't set an output when no latest reference was identified. Steps
+			// conditioned on the output then stay skipped instead of running
+			// against a zero-valued reference.
+			if latestReference == nil {
+				return nil, nil
+			}
+
 			return workflow.SetOutput("reference", latestReference), nil
 		},
 	}

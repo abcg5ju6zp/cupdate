@@ -3,6 +3,7 @@ package imageworkflow
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/AlexGustafsson/cupdate/internal/oci"
 	"github.com/AlexGustafsson/cupdate/internal/workflow"
@@ -35,31 +36,38 @@ func GetProvenanceAttestations() workflow.Step {
 				return nil, err
 			}
 
-			// TODO: Instead of getting the attestations for all images (typically the
-			// case for multi-arch images), we could use the host / node information
-			// from the graph to only get data for the architectures in use
+			// Read attestations one digest at a time. A failed or short blob read
+			// only fails the digest's read; other attestations are kept. The stage
+			// is retried for the missing digests on the next processing run.
 			attestations := make(map[string]oci.ProvenanceAttestation)
+			errs := make([]string, 0)
 			for manifestDigest, attestationManifest := range manifests {
 				_, provenanceBlobDigest, ok := attestationManifest.ProvenanceLayerDigest()
 				if !ok {
-					return nil, nil
+					continue
 				}
 
 				blob, err := registryClient.GetBlob(ctx, image, provenanceBlobDigest, true)
 				if err != nil {
-					return nil, err
+					errs = append(errs, fmt.Sprintf("%s: %v", manifestDigest, err))
+					continue
 				}
-				defer blob.Close()
 
 				var attestation oci.ProvenanceAttestation
-				if err := json.NewDecoder(blob).Decode(&attestation); err != nil {
-					return nil, err
+				if decodeErr := json.NewDecoder(blob).Decode(&attestation); decodeErr != nil {
+					blob.Close()
+					errs = append(errs, fmt.Sprintf("%s: %v", manifestDigest, decodeErr))
+					continue
 				}
+				blob.Close()
 
 				attestations[manifestDigest] = attestation
 			}
 
-			return workflow.SetOutput("attestations", attestations), nil
+			return workflow.Batch(
+				workflow.SetOutput("attestations", attestations),
+				workflow.SetOutput("errors", errs),
+			), nil
 		},
 	}
 }

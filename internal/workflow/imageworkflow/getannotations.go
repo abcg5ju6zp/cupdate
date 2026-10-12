@@ -38,14 +38,27 @@ func GetAnnotations() workflow.Step {
 			var manifests []oci.ImageManifest
 			switch m := manifest.(type) {
 			case *oci.ImageIndex:
-				manifest = m.Manifests
+				manifests = m.Manifests
 			case *oci.ImageManifest:
-				manifest = []oci.ImageManifest{*m}
+				manifests = []oci.ImageManifest{*m}
+			}
+
+			// Default to the host platform. The worker pins the platform for the
+			// generation, but the defaults keep direct uses of the step compatible.
+			architecture, err := workflow.GetInput[string](ctx, "architecture", false)
+			if err != nil || architecture == "" {
+				architecture = runtime.GOARCH
+			}
+
+			os, err := workflow.GetInput[string](ctx, "os", false)
+			if err != nil {
+				os = runtime.GOOS
 			}
 
 			annotations, err := registryClient.GetAnnotations(ctx, image, &oci.GetAnnotationsOptions{
 				Manifests:    manifests,
-				Architecture: runtime.GOARCH,
+				Architecture: architecture,
+				OS:           os,
 			})
 			if err != nil {
 				return nil, err

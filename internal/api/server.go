@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -300,6 +301,23 @@ func NewServer(
 
 		response, err := api.GetLatestWorkflowRun(ctx, reference)
 		if response == nil && err == nil {
+			s.handleGenericResponse(w, r, ErrNotFound)
+			return
+		}
+
+		s.handleJSONResponse(w, r, response, err)
+	})
+
+	s.mux.HandleFunc("GET /api/v1/image/generation", func(w http.ResponseWriter, r *http.Request) {
+		ctx, span := httputil.SpanFromRequest(r)
+		span.SetAttributes(semconv.HTTPRoute("/api/v1/image/generation"))
+
+		query := r.URL.Query()
+
+		reference := query.Get("reference")
+
+		response, err := s.api.GetCurrentGeneration(ctx, reference)
+		if errors.Is(err, sql.ErrNoRows) {
 			s.handleGenericResponse(w, r, ErrNotFound)
 			return
 		}

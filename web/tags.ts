@@ -123,6 +123,11 @@ export const Tags: Tag[] = [
     description: 'Incomplete information',
     color: 'warning',
   },
+  {
+    name: 'status:complete',
+    description: 'All information collected',
+    color: 'positive',
+  },
 
   // Security warnings
   {

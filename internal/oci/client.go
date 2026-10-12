@@ -3,6 +3,7 @@ package oci
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -444,6 +445,11 @@ func (c *Client) GetAttestationManifests(ctx context.Context, ref Reference, opt
 		return nil, err
 	}
 
+	// Per-manifest errors are collected so that an interrupted pagination or a
+	// failed blob read doesn't discard attestations collected for other
+	// manifests. The returned error (if any) is joined with the partial result.
+	var errs []error
+
 	var manifests []ImageManifest
 	switch m := manifestOrIndex.(type) {
 	case *ImageManifest:
@@ -498,17 +504,19 @@ func (c *Client) GetAttestationManifests(ctx context.Context, ref Reference, opt
 				ref.Digest = digest
 				ref.HasDigest = true
 
-				manifestOrIndex, err := c.GetManifest(ctx, ref)
+				attestationManifest, err := c.GetManifest(ctx, ref)
 				if err != nil {
-					return nil, err
+					errs = append(errs, fmt.Errorf("%s: %w", manifest.Digest, err))
+					continue
 				}
 
-				attestationManifest, ok := manifestOrIndex.(*ImageManifest)
+				imageManifest, ok := attestationManifest.(*ImageManifest)
 				if !ok {
-					return nil, fmt.Errorf("expected an image manifest, got an image index manifest")
+					errs = append(errs, fmt.Errorf("%s: expected an image manifest, got an image index manifest", manifest.Digest))
+					continue
 				}
 
-				attestationManifests[manifest.Digest] = attestationManifest
+				attestationManifests[manifest.Digest] = imageManifest
 				continue
 			}
 		}
@@ -516,7 +524,8 @@ func (c *Client) GetAttestationManifests(ctx context.Context, ref Reference, opt
 		// Next, we try to use the OCI referrers API, which is not as widespread
 		referrersManifest, err := c.GetReferrers(ctx, ref, manifest.Digest)
 		if err != nil {
-			return nil, err
+			errs = append(errs, fmt.Errorf("%s: %w", manifest.Digest, err))
+			continue
 		}
 
 		if referrersManifest == nil {
@@ -529,35 +538,38 @@ func (c *Client) GetAttestationManifests(ctx context.Context, ref Reference, opt
 			Layers:        make([]Layer, 0),
 		}
 
-		for _, manifest := range referrersManifest.Manifests {
-			if manifest.ArtifactType == "application/vnd.in-toto+json" && manifest.Annotations.InTotoPredicateType() == "https://spdx.dev/Document" ||
-				manifest.ArtifactType == "application/vnd.in-toto+json" && strings.HasPrefix(manifest.Annotations.InTotoPredicateType(), "https://slsa.dev/provenance/") ||
-				manifest.ArtifactType == "application/vnd.in-toto+json" && strings.HasPrefix(manifest.Annotations.InTotoPredicateType(), "https://cyclonedx.org/bom/") {
+		for _, referredManifest := range referrersManifest.Manifests {
+			if referredManifest.ArtifactType == "application/vnd.in-toto+json" && referredManifest.Annotations.InTotoPredicateType() == "https://spdx.dev/Document" ||
+				referredManifest.ArtifactType == "application/vnd.in-toto+json" && strings.HasPrefix(referredManifest.Annotations.InTotoPredicateType(), "https://slsa.dev/provenance/") ||
+				referredManifest.ArtifactType == "application/vnd.in-toto+json" && strings.HasPrefix(referredManifest.Annotations.InTotoPredicateType(), "https://cyclonedx.org/bom/") {
 				ref := ref
-				ref.Digest = manifest.Digest
+				ref.Digest = referredManifest.Digest
 				ref.HasDigest = true
 				indexOrManifest, err := c.GetManifest(ctx, ref)
 				if err != nil {
-					return nil, err
+					errs = append(errs, fmt.Errorf("%s: %w", referredManifest.Digest, err))
+					continue
 				}
 
-				manifest, ok := indexOrManifest.(*ImageManifest)
+				referredImageManifest, ok := indexOrManifest.(*ImageManifest)
 				if !ok {
-					return nil, fmt.Errorf("expected an image manifest, got an image index manifest")
+					errs = append(errs, fmt.Errorf("%s: expected an image manifest, got an image index manifest", referredManifest.Digest))
+					continue
 				}
 
-				if len(manifest.Layers) != 1 {
-					return nil, fmt.Errorf("expected a single layer in referred manifest")
+				if len(referredImageManifest.Layers) != 1 {
+					errs = append(errs, fmt.Errorf("%s: expected a single layer in referred manifest", referredManifest.Digest))
+					continue
 				}
 
-				attestationManifest.Layers = append(attestationManifest.Layers, manifest.Layers[0])
+				attestationManifest.Layers = append(attestationManifest.Layers, referredImageManifest.Layers[0])
 			}
 		}
 
 		attestationManifests[manifest.Digest] = attestationManifest
 	}
 
-	return attestationManifests, nil
+	return attestationManifests, errors.Join(errs...)
 }
 
 type GetTagsOptions struct {

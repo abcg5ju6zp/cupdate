@@ -2,7 +2,10 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"runtime"
+	"sync"
 	"time"
 
 	"github.com/AlexGustafsson/cupdate/internal/events"
@@ -39,6 +42,13 @@ type Event struct {
 	Type      EventType
 }
 
+// inflightCall coalesces concurrent processing of the same reference so that
+// concurrent queue items reuse the same generation receipts.
+type inflightCall struct {
+	done chan struct{}
+	err  error
+}
+
 // Worker processes raw container image entries, running the image workflow and
 // storing the result to the state store.
 // The worker produces events of the type [Event].
@@ -49,6 +59,9 @@ type Worker struct {
 	store           *store.Store
 	registryAuth    *httputil.AuthMux
 	registryMirrors map[string]string
+
+	inflightMu sync.Mutex
+	inflight   map[string]*inflightCall
 
 	processedCounter   prometheus.Counter
 	processingDuration prometheus.Counter
@@ -63,6 +76,8 @@ func New(httpClient httputil.Requester, store *store.Store, registryAuth *httput
 		store:           store,
 		registryAuth:    registryAuth,
 		registryMirrors: registryMirrors,
+
+		inflight: make(map[string]*inflightCall),
 
 		processedCounter: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: "cupdate",
@@ -82,8 +97,39 @@ func New(httpClient httputil.Requester, store *store.Store, registryAuth *httput
 	}
 }
 
-// ProcessRawImage processes a raw image by the specified reference.
+// ProcessRawImage processes a raw image by the specified reference. Concurrent
+// processing of the same reference coalesces onto the same in-flight call.
 func (w *Worker) ProcessRawImage(ctx context.Context, reference oci.Reference) error {
+	key := reference.String()
+
+	w.inflightMu.Lock()
+	if call, ok := w.inflight[key]; ok {
+		w.inflightMu.Unlock()
+		log := slog.With(slog.String("reference", key))
+		log.DebugContext(ctx, "Reusing in-flight processing")
+		select {
+		case <-call.done:
+			return call.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	call := &inflightCall{done: make(chan struct{})}
+	w.inflight[key] = call
+	w.inflightMu.Unlock()
+
+	call.err = w.processRawImage(ctx, reference)
+	close(call.done)
+
+	w.inflightMu.Lock()
+	delete(w.inflight, key)
+	w.inflightMu.Unlock()
+
+	return call.err
+}
+
+func (w *Worker) processRawImage(ctx context.Context, reference oci.Reference) error {
 	start := time.Now()
 	w.processingGauge.Inc()
 	defer w.processingGauge.Dec()
@@ -97,11 +143,6 @@ func (w *Worker) ProcessRawImage(ctx context.Context, reference oci.Reference) e
 	log.DebugContext(ctx, "Processing reference")
 
 	// Try to update the image's process time
-	// NOTE: There's a race here if the entry has been modified or removed since
-	// it was loaded from the store. It will eventually be corrent and consistent,
-	// though. And it's unlikely to happen. So let's not keep a transaction during
-	// processing for now. If it becomes important, we could keep an "etag" /
-	// generation id in the document and throw an error if the expectation fails.
 	// NOTE: Always update immediately as a failure to process or update the image
 	// could be a reoccuring issue, so try to process other images before retrying
 	// the failing image.
@@ -116,10 +157,31 @@ func (w *Worker) ProcessRawImage(ctx context.Context, reference oci.Reference) e
 		underlyingReference = reference.WithDomain(underlyingDomain)
 	}
 
-	log.DebugContext(ctx, "Running workflow")
+	// Pin the generation's manifest digest before collecting anything. A moving
+	// tag can no longer mix another digest's data into this processing run.
+	digest, err := pinManifestDigest(ctx, w.httpClient, w.registryAuth, underlyingReference)
+	if err != nil {
+		log.WarnContext(ctx, "Failed to pin manifest digest", slog.Any("error", err))
+	}
+
+	platform := targetPlatform()
+
+	// Begin (or resume) the generation for the pinned tuple. This immediately
+	// becomes the current generation, so late writes from an older generation
+	// cannot overwrite data of a newer one.
+	generation, err := w.store.BeginGeneration(ctx, reference.String(), underlyingReference.String(), digest, platform)
+	if err != nil {
+		return err
+	}
+
+	log = log.With(slog.String("digest", digest), slog.String("platform", platform), slog.Int64("generation", generation.ID))
+
 	data := &imageworkflow.Data{
 		ImageReference:           reference,
 		UnderlyingImageReference: underlyingReference,
+		Digest:                   digest,
+		PlatformOS:               runtime.GOOS,
+		PlatformArch:             runtime.GOARCH,
 		Image:                    "",
 		Annotations:              nil,
 		LatestReference:          nil,
@@ -136,19 +198,39 @@ func (w *Worker) ProcessRawImage(ctx context.Context, reference oci.Reference) e
 		data.InsertTag(tag)
 	}
 
-	workflow := imageworkflow.New(w.httpClient, data)
-	workflowRun, err := workflow.Run(ctx)
-	if err != nil {
-		ociJobFailed := workflowRun.Jobs[0].Result == models.JobRunResultFailed
-		if ociJobFailed {
-			log.ErrorContext(ctx, "Failed to run image workflow", slog.Any("error", err))
-			data.InsertTag("status:failed")
+	// Reuse verifiable stage receipts from prior runs
+	hydrateData(data, generation)
+
+	// If all stages are covered by receipts, recollect nothing. This covers
+	// concurrent queue items, service restarts and cache hits.
+	var workflowRun models.WorkflowRun
+	reusedReceipts := canSkipWorkflow(generation)
+	if reusedReceipts {
+		log.DebugContext(ctx, "Reusing collection receipts, skipping workflow")
+		if run, ok := hydrateWorkflowRun(generation); ok {
+			workflowRun = run
 		} else {
-			log.WarnContext(ctx, "Failed to run a subset of image workflow", slog.Any("error", err))
-			data.InsertTag("status:incomplete")
+			reusedReceipts = false
 		}
-		// Fallthrough - insert what we have
 	}
+
+	if !reusedReceipts {
+		log.DebugContext(ctx, "Running workflow")
+		flow := imageworkflow.New(w.httpClient, data)
+		workflowRun, err = flow.Run(ctx)
+		if err != nil {
+			if jobFailed(&workflowRun, "oci") {
+				log.ErrorContext(ctx, "Failed to run image workflow", slog.Any("error", err))
+			} else {
+				log.WarnContext(ctx, "Failed to run a subset of image workflow", slog.Any("error", err))
+			}
+			// Fallthrough - record stage failures and publish what we have
+		}
+	}
+
+	// Re-derive tags that are normally inserted by workflow jobs, so that
+	// reused receipts produce the same tags.
+	rederiveTags(data)
 
 	versionDiffSortable := semver.PackInt64(nil)
 
@@ -222,7 +304,30 @@ func (w *Worker) ProcessRawImage(ctx context.Context, reference oci.Reference) e
 		}
 	}
 
-	timeBeforeInsert := time.Now()
+	// Evaluate independent stage outcomes and merge them with prior receipts
+	outcomes := evaluateStages(data, &workflowRun, underlyingReference.Domain)
+	if !reusedReceipts {
+		outcomes = append(outcomes, evaluatedStage{name: imageworkflow.StageWorkflow, status: models.ImageGenerationStageStatusSucceeded})
+	}
+
+	now := time.Now()
+	stages := mergeStages(stageReceipts(generation), outcomes, now)
+	stages = attachReceiptBlobs(stages, data, workflowRun)
+
+	// Determine the generation's overall state
+	generation.Stages = stages
+	switch {
+	case !stageSucceeded(stages, imageworkflow.StageManifest):
+		generation.Status = models.ImageGenerationStatusFailed
+		data.InsertTag("status:failed")
+	case hasFailedStage(stages):
+		generation.Status = models.ImageGenerationStatusPartial
+		data.InsertTag("status:incomplete")
+	default:
+		generation.Status = models.ImageGenerationStatusComplete
+		data.InsertTag("status:complete")
+	}
+	generation.Completed = &now
 
 	result := models.Image{
 		Reference:           data.ImageReference.String(),
@@ -242,99 +347,44 @@ func (w *Worker) ProcessRawImage(ctx context.Context, reference oci.Reference) e
 	if data.LatestReference != nil {
 		result.LatestReference = data.LatestReference.String()
 	}
-	if err := w.store.InsertImage(ctx, &result, false); err != nil {
-		log.ErrorContext(ctx, "Failed to insert image", slog.Any("error", err))
-		// Fallthrough - try to insert what we have
+
+	vulnerabilities := data.Vulnerabilities
+	if vulnerabilities == nil {
+		vulnerabilities = make([]models.ImageVulnerability, 0)
 	}
 
-	if data.FullDescription.OK {
-		if data.FullDescription.Value == nil {
-			if err := w.store.DeleteImageDescription(ctx, reference.String()); err != nil {
-				log.ErrorContext(ctx, "Failed to delete image description", slog.Any("error", err))
-				// Fallthrough - try to insert what we have
-			}
-		} else {
-			if err := w.store.InsertImageDescription(ctx, reference.String(), data.FullDescription.Value); err != nil {
-				log.ErrorContext(ctx, "Failed to insert image description", slog.Any("error", err))
-				// Fallthrough - try to insert what we have
-			}
+	// Publish all data of the generation as one atomic unit. Stages confirmed
+	// absent delete their visible rows; stages not yet confirmed carry no data.
+	timeBeforeInsert := time.Now()
+	publication := &store.ImageGenerationPublication{
+		Generation:       generation,
+		Image:            &result,
+		HasDescription:   stageAvailable(stages, imageworkflow.StageDescription),
+		Description:      data.FullDescription.Value,
+		HasReleaseNotes:  stageAvailable(stages, imageworkflow.StageReleaseNotes),
+		ReleaseNotes:     data.ReleaseNotes.Value,
+		HasScorecard:     stageAvailable(stages, imageworkflow.StageScorecard),
+		Scorecard:        data.Scorecard.Value,
+		HasProvenance:    stageAvailable(stages, imageworkflow.StageProvenance),
+		Provenance:       data.Provenance.Value,
+		HasSBOM:          stageAvailable(stages, imageworkflow.StageSBOM),
+		SBOM:             data.SBOM.Value,
+		Vulnerabilities: vulnerabilities,
+		Graph:           &data.Graph,
+		WorkflowRun:     workflowRun,
+	}
+
+	if err := w.store.PublishGeneration(ctx, publication); err != nil {
+		if errors.Is(err, store.ErrStaleGeneration) {
+			log.InfoContext(ctx, "Discarding late write from stale generation")
+			return nil
 		}
+		log.ErrorContext(ctx, "Failed to publish generation", slog.Any("error", err))
+		return err
 	}
-
-	if data.ReleaseNotes.OK {
-		if data.ReleaseNotes.Value == nil {
-			if err := w.store.DeleteImageReleaseNotes(ctx, reference.String()); err != nil {
-				log.ErrorContext(ctx, "Failed to delete image release notes", slog.Any("error", err))
-				// Fallthrough - try to insert what we have
-			}
-		} else {
-			if err := w.store.InsertImageReleaseNotes(ctx, reference.String(), data.ReleaseNotes.Value); err != nil {
-				log.ErrorContext(ctx, "Failed to insert image release notes", slog.Any("error", err))
-				// Fallthrough - try to insert what we have
-			}
-		}
-	}
-
-	if err := w.store.InsertImageGraph(ctx, reference.String(), &data.Graph); err != nil {
-		log.ErrorContext(ctx, "Failed to insert image graph", slog.Any("error", err))
-		// Fallthrough - try to insert what we have
-	}
-
-	if data.Scorecard.OK {
-		if data.Scorecard.Value == nil {
-			if err := w.store.DeleteImageScorecard(ctx, reference.String()); err != nil {
-				log.ErrorContext(ctx, "Failed to delete image scorecard", slog.Any("error", err))
-				// Fallthrough - try to insert what we have
-			}
-		} else {
-			if err := w.store.InsertImageScorecard(ctx, reference.String(), data.Scorecard.Value); err != nil {
-				log.ErrorContext(ctx, "Failed to insert image scorecard", slog.Any("error", err))
-				// Fallthrough - try to insert what we have
-			}
-		}
-	}
-
-	if data.Provenance.OK {
-		if data.Provenance.Value == nil {
-			if err := w.store.DeleteImageProvenance(ctx, reference.String()); err != nil {
-				log.ErrorContext(ctx, "Failed to delete image provenance", slog.Any("error", err))
-				// Fallthrough - try to insert what we have
-			}
-		} else {
-			if err := w.store.InsertImageProvenance(ctx, reference.String(), data.Provenance.Value); err != nil {
-				log.ErrorContext(ctx, "Failed to insert image provenance", slog.Any("error", err))
-				// Fallthrough - try to insert what we have
-			}
-		}
-	}
-
-	if data.SBOM.OK {
-		if data.SBOM.Value == nil {
-			if err := w.store.DeleteImageSBOM(ctx, reference.String()); err != nil {
-				log.ErrorContext(ctx, "Failed to delete image SBOM", slog.Any("error", err))
-				// Fallthrough - try to insert what we have
-			}
-		} else {
-			if err := w.store.InsertImageSBOM(ctx, reference.String(), data.SBOM.Value); err != nil {
-				log.ErrorContext(ctx, "Failed to insert image SBOM", slog.Any("error", err))
-				// Fallthrough - try to insert what we have
-			}
-		}
-	}
-
-	if err := w.store.InsertImageVulnerabilities(ctx, reference.String(), data.Vulnerabilities); err != nil {
-		log.ErrorContext(ctx, "Failed to insert image vulnerabilities", slog.Any("error", err))
-		// Fallthrough - try to insert what we have
-	}
-
-	if err := w.store.InsertWorkflowRun(ctx, reference.String(), workflowRun); err != nil {
-		log.ErrorContext(ctx, "Failed to insert workflow run", slog.Any("error", err))
-		// Fallthrough - try to insert what we have
-	}
-
 	timeAfterInsert := time.Now()
 
-	log.DebugContext(ctx, "Processed image")
+	log.DebugContext(ctx, "Processed image", slog.String("status", string(generation.Status)))
 	w.processedCounter.Inc()
 	w.processingDuration.Add(time.Since(start).Seconds())
 
@@ -348,18 +398,10 @@ func (w *Worker) ProcessRawImage(ctx context.Context, reference oci.Reference) e
 		log.ErrorContext(ctx, "Failed to identify changes", slog.Any("error", err))
 	} else if len(changes) > 0 {
 		log.DebugContext(ctx, "Updated image date", slog.Int("changes", len(changes)))
-		// TODO: Group changes, create an event specifying the time. That way the
-		// browser can ignore the event if it already updated after the time?
 		w.Broadcast(ctx, Event{
 			Reference: reference.String(),
 			Type:      EventTypeUpdated,
 		})
-
-		// TODO: Have another readonly job for going over the changes made to
-		// references to identify updates every now and then for third-party alerts.
-		// For now, just do it on the RSS field? Perhaps try to use the change time
-		// as the article time if the time of release is not found.
-		// TODO: Instead of readonly job, just watch the events instead?
 	}
 
 	if result.LatestReference != "" && result.LatestReference != result.Reference {
@@ -375,6 +417,32 @@ func (w *Worker) ProcessRawImage(ctx context.Context, reference oci.Reference) e
 	})
 
 	return nil
+}
+
+// rederiveTags re-adds semantic tags from hydrated data when the workflow was
+// not run (or when the data came from receipts).
+func rederiveTags(data *imageworkflow.Data) {
+	if data.SBOM.OK && data.SBOM.Value != nil && len(data.SBOM.Value.SBOM) > 0 {
+		data.InsertTag("sbom")
+	}
+
+	for _, link := range data.Links {
+		switch link.Type {
+		case "github", "github-releases":
+			data.InsertTag("github")
+		case "gitlab":
+			data.InsertTag("gitlab")
+		}
+	}
+}
+
+func hasFailedStage(stages []models.ImageGenerationStage) bool {
+	for _, stage := range stages {
+		if stage.Status == models.ImageGenerationStageStatusFailed {
+			return true
+		}
+	}
+	return false
 }
 
 // Collect implements prometheus.Collector.

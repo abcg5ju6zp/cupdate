@@ -119,6 +119,61 @@ type SBOM struct {
 	OperatingSystem     string `json:"operatingSystem,omitempty"`
 }
 
+// ImageGenerationStatus is the state of a collection generation.
+type ImageGenerationStatus string
+
+const (
+	// ImageGenerationStatusComplete denotes that all applicable collection
+	// stages completed successfully.
+	ImageGenerationStatusComplete ImageGenerationStatus = "complete"
+	// ImageGenerationStatusPartial denotes that one or more collection stages
+	// failed, but data from other stages is available.
+	ImageGenerationStatusPartial ImageGenerationStatus = "partial"
+	// ImageGenerationStatusFailed denotes that the pinned manifest itself could
+	// not be collected.
+	ImageGenerationStatusFailed ImageGenerationStatus = "failed"
+)
+
+// ImageGenerationStageStatus is the state of an individual collection stage.
+type ImageGenerationStageStatus string
+
+const (
+	ImageGenerationStageStatusSucceeded ImageGenerationStageStatus = "succeeded"
+	ImageGenerationStageStatusFailed    ImageGenerationStageStatus = "failed"
+)
+
+// ImageGeneration is a single generation of collected image intelligence. A
+// generation is pinned to a canonical reference, target platform and manifest
+// digest, ensuring all published data describes the same image.
+type ImageGeneration struct {
+	ID int64 `json:"id"`
+
+	Reference           string `json:"reference"`
+	UnderlyingReference string `json:"underlyingReference"`
+	Digest              string `json:"digest"`
+	Platform            string `json:"platform"`
+
+	Status    ImageGenerationStatus `json:"status"`
+	Started   time.Time             `json:"started"`
+	Completed *time.Time            `json:"completed,omitempty"`
+
+	Stages []ImageGenerationStage `json:"stages"`
+}
+
+// ImageGenerationStage is a verifiable receipt for a single collection stage of
+// a generation. Blob holds the canonical stage payload, allowing the stage's
+// result to be reused by concurrent queue items, cache hits and service
+// restarts without recollecting data.
+type ImageGenerationStage struct {
+	Name   string                      `json:"name"`
+	Status ImageGenerationStageStatus `json:"status"`
+	Source string                      `json:"source,omitempty"`
+	Error  string                      `json:"error,omitempty"`
+	Blob   []byte                      `json:"-"`
+
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
 type WorkflowRunResult string
 
 const (
