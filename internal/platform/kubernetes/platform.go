@@ -64,7 +64,7 @@ func (p *Platform) Graph(ctx context.Context) error {
 }
 
 // Graphs implements platform.ContinuousGrapher.
-func (p *Platform) Graphs() <-chan platform.Graph {
+func (p *Platform) Graphs() <-chan platform.Snapshot {
 	return p.grapher.Graphs()
 }
 

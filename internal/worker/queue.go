@@ -102,7 +102,25 @@ func (q *Queue[T]) PushFront(items ...T) {
 // PushBack puts one or more unique items at the back of the queue.
 // Panics if the queue is closed.
 func (q *Queue[T]) PushBack(items ...T) {
-	q.setFunc(func(backlog []T) []T {
+	if !q.trySetFunc(func(backlog []T) []T {
+		// Add unique items to the backlog
+		for _, item := range items {
+			if !slices.Contains(backlog, item) {
+				backlog = append(backlog, item)
+			}
+		}
+		return backlog
+	}) {
+		panic("worker: push on closed queue")
+	}
+}
+
+// TryPushBack is like [Queue.PushBack] but returns false instead of panicking
+// when the queue is closed. Callers that must not lose the item when the queue
+// is shutting down (for example because it was durably recorded elsewhere) use
+// it to keep the item for later recovery.
+func (q *Queue[T]) TryPushBack(items ...T) bool {
+	return q.trySetFunc(func(backlog []T) []T {
 		// Add unique items to the backlog
 		for _, item := range items {
 			if !slices.Contains(backlog, item) {
@@ -114,17 +132,24 @@ func (q *Queue[T]) PushBack(items ...T) {
 }
 
 func (q *Queue[T]) setFunc(f func([]T) []T) {
+	if !q.trySetFunc(f) {
+		panic("worker: push on closed queue")
+	}
+}
+
+func (q *Queue[T]) trySetFunc(f func([]T) []T) bool {
 	q.cond.L.Lock()
 	defer q.cond.L.Unlock()
 
 	if q.closed {
-		panic("worker: push on closed queue")
+		return false
 	}
 
 	q.backlog = f(q.backlog)
 
 	q.lengthGauge.Set(float64(len(q.backlog)))
 	q.cond.Broadcast()
+	return true
 }
 
 // Pull returns an iterator which will feed a consumer with items.
@@ -159,6 +184,8 @@ func (q *Queue[T]) Pull() iter.Seq[T] {
 
 // Len returns the size of the queue.
 func (q *Queue[T]) Len() int {
+	q.cond.L.Lock()
+	defer q.cond.L.Unlock()
 	return len(q.backlog)
 }
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/AlexGustafsson/cupdate/internal/platform"
@@ -25,12 +26,19 @@ type InformerGrapher struct {
 	informerFactory informers.SharedInformerFactory
 
 	events chan time.Time
-	ch     chan platform.Graph
+	ch     chan platform.Snapshot
 
 	close chan struct{}
 
 	includeOldReplicaSets bool
 	debounceInterval      time.Duration
+
+	// generation is stamped per round of discovery. It is assigned before the
+	// informer caches are read, ensuring that rounds triggered by consecutive
+	// events, initial lists and manual polls arbitrate deterministically and
+	// that a late, older scan carries a lower generation than rounds started
+	// later.
+	generation atomic.Uint64
 
 	mutex sync.Mutex
 }
@@ -74,7 +82,7 @@ func (g *InformerGrapher) Start() {
 	g.mutex.Lock()
 	defer g.mutex.Unlock()
 
-	g.ch = make(chan platform.Graph)
+	g.ch = make(chan platform.Snapshot)
 	g.events = make(chan time.Time)
 	g.close = make(chan struct{})
 
@@ -141,6 +149,11 @@ func (g *InformerGrapher) Close() {
 
 // Graph implements platform.Platform.
 func (g *InformerGrapher) Graph(ctx context.Context) error {
+	// Pin the generation before reading the informer caches so that the order
+	// of generations reflects the order of discovery, not completion
+	generation := g.generation.Add(1)
+	capturedAt := time.Now()
+
 	resources := make(map[types.UID]v1.Object)
 
 	deployments, err := g.informerFactory.Apps().V1().Deployments().Lister().List(labels.Everything())
@@ -287,14 +300,19 @@ func (g *InformerGrapher) Graph(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case g.ch <- graph:
+	case g.ch <- platform.Snapshot{
+		Platform:   "kubernetes",
+		Generation: generation,
+		CapturedAt: capturedAt,
+		Graph:      graph,
+	}:
 		return nil
 	}
 }
 
-// Graphs returns a channel which will receive all graphs produced by the
+// Graphs returns a channel which will receive all snapshots produced by the
 // grapher asynchronously. The returned channel is shared among all consumers.
-func (g *InformerGrapher) Graphs() <-chan platform.Graph {
+func (g *InformerGrapher) Graphs() <-chan platform.Snapshot {
 	return g.ch
 }
 

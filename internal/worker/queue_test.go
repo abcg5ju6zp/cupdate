@@ -154,6 +154,19 @@ func TestQueueEmptiedOnClose(t *testing.T) {
 	assert.Equal(t, 0, q.Len())
 }
 
+func TestQueueTryPushBack(t *testing.T) {
+	q := NewQueue[string](5, 0)
+
+	assert.True(t, q.TryPushBack("1", "2"))
+	assert.Equal(t, 2, q.Len())
+
+	// A closed queue reports failure instead of panicking so callers can retain
+	// the item for later recovery
+	q.Close()
+	assert.False(t, q.TryPushBack("3"))
+	assert.Equal(t, 0, q.Len())
+}
+
 func TestQueueDeduplication(t *testing.T) {
 	q := NewQueue[oci.Reference](2, 0)
 	defer q.Close()

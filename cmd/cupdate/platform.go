@@ -51,6 +51,7 @@ func ConfigurePlatform(ctx context.Context, config *Config) (platform.Continuous
 		}
 
 		return platform.NewPollGrapher(
+			"docker",
 			&platform.CompoundGrapher{
 				Graphers: graphers,
 			},
@@ -61,6 +62,7 @@ func ConfigurePlatform(ctx context.Context, config *Config) (platform.Continuous
 	// 2. Static platform
 	if config.Static.FilePath != "" {
 		return platform.NewPollGrapher(
+			"static",
 			&static.Platform{
 				FilePath: config.Static.FilePath,
 			},

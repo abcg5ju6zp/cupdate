@@ -103,7 +103,10 @@ func run(environ []string, signals <-chan os.Signal) ExitCode {
 		worker := worker.New(httpClient, writeStore, config.RegistryAuth(), config.RegistryMirrors())
 		prometheus.DefaultRegisterer.MustRegister(worker)
 
-		platformHub := events.NewHub[models.PlatformEvent]()
+		// The platform hub replays the last confirmed generation to new
+		// subscribers so temporarily disconnected subscribers can catch up
+		// without another graph being produced
+		platformHub := events.NewReplayHub[models.PlatformEvent]()
 
 		httpServer := ConfigureServer(config, httpClient, readStore, worker.Hub, platformHub, processQueue, targetPlatform)
 

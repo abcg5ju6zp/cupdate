@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -48,6 +49,59 @@ func (m *TestNode) Labels() Labels {
 // InternalLabels implements Node.
 func (m *TestNode) InternalLabels() InternalLabels {
 	return nil
+}
+
+func TestPollGrapherSnapshotsCarryMonotonicGenerations(t *testing.T) {
+	graph1 := NewGraph()
+	graph1.InsertTree(
+		&TestNode{id: "graph1/node1", nodeType: "testnode"},
+	)
+
+	graph2 := NewGraph()
+	graph2.InsertTree(
+		&TestNode{id: "graph2/node1", nodeType: "testnode"},
+	)
+
+	grapher := &MockGrapher{}
+	grapher.On("Graph", mock.Anything).Return(graph1, nil).Once()
+	grapher.On("Graph", mock.Anything).Return(graph2, nil).Once()
+
+	// A long interval keeps the poller itself quiet; rounds are driven manually
+	poller := NewPollGrapher("test-platform", grapher, time.Hour)
+	defer poller.Close()
+
+	snapshots := poller.Graphs()
+	errCh := make(chan error, 2)
+
+	go func() { errCh <- poller.Graph(t.Context()) }()
+	var snapshot1 Snapshot
+	select {
+	case snapshot1 = <-snapshots:
+	case <-time.After(time.Second):
+		t.Fatal("did not receive first snapshot")
+	}
+	require.NoError(t, <-errCh)
+
+	go func() { errCh <- poller.Graph(t.Context()) }()
+	var snapshot2 Snapshot
+	select {
+	case snapshot2 = <-snapshots:
+	case <-time.After(time.Second):
+		t.Fatal("did not receive second snapshot")
+	}
+	require.NoError(t, <-errCh)
+
+	assert.Equal(t, "test-platform", snapshot1.Platform)
+	assert.EqualValues(t, 1, snapshot1.Generation)
+	assert.Equal(t, graph1, snapshot1.Graph)
+	assert.False(t, snapshot1.CapturedAt.IsZero())
+
+	assert.Equal(t, "test-platform", snapshot2.Platform)
+	assert.EqualValues(t, 2, snapshot2.Generation)
+	assert.Equal(t, graph2, snapshot2.Graph)
+	assert.True(t, snapshot2.CapturedAt.After(snapshot1.CapturedAt) || snapshot2.CapturedAt.Equal(snapshot1.CapturedAt))
+
+	grapher.AssertExpectations(t)
 }
 
 func TestCompoundGrapherHappyPath(t *testing.T) {

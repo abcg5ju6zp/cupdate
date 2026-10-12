@@ -9,7 +9,7 @@ import (
 	"slices"
 )
 
-const Revision = 10
+const Revision = 11
 
 //go:embed migrations
 var migrations embed.FS
